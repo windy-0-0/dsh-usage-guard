@@ -73,9 +73,9 @@ function GuardBadge(): React.ReactElement | null {
   const balanceText = status.balance
     ? `余额 ¥${status.balance.value.toFixed(2)}`
     : (status.official?.err === 'no-platform-token' ? '未配平台 token（仅余额哨兵）' : '余额不可用')
-  const officialText = status.official?.err === undefined
-    ? `官方今日 ${fmtTokens(status.official.tokens ?? 0)} tok`
-    : (status.official?.err === 'no-platform-token' ? '' : '官方用量不可用')
+  const officialText = status.official && status.official.err === undefined
+    ? `官方今日 ${fmtTokens(typeof status.official.tokens === 'number' ? status.official.tokens : 0)} tok`
+    : (status.official && status.official.err === 'no-platform-token' ? '' : '官方用量不可用')
   const localText = `本机 ${fmtTokens(status.local?.tokens ?? 0)} tok · ¥${(status.local?.costCny ?? 0).toFixed(4)}`
   const checked = status.checkedAt ? new Date(status.checkedAt) : null
   const checkedText = checked === null ? '' : `对账 ${String(checked.getHours()).padStart(2, '0')}:${String(checked.getMinutes()).padStart(2, '0')}`
