@@ -308,10 +308,10 @@ export function apply(ctx: any): void {
               const credentials = ctx.get('credentials')
               let configured = false
               try {
-                const rec = credentials && typeof credentials.readRecord === 'function'
-                  ? await credentials.readRecord('DEEPSEEK_PLATFORM_TOKEN')
+                const resolved = credentials && typeof credentials.resolve === 'function'
+                  ? await credentials.resolve('DEEPSEEK_PLATFORM_TOKEN')
                   : undefined
-                configured = rec !== undefined && rec !== null
+                configured = !!(resolved && typeof resolved.value === 'string' && resolved.value)
               } catch { configured = false }
               return send(200, { ok: true, configured })
             }
