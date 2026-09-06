@@ -304,6 +304,39 @@ export function apply(ctx: any): void {
             const path = new URL(req.url ?? '/', 'http://localhost').pathname.replace(/^\/dsh-usage-guard\/api/, '') || '/'
             if (req.method === 'GET' && path === '/status') return send(200, await runCheck())
             if (req.method === 'POST' && path === '/check') return send(200, await runCheck())
+            if (req.method === 'GET' && path === '/cred-status') {
+              const credentials = ctx.get('credentials')
+              let configured = false
+              try {
+                const rec = credentials && typeof credentials.readRecord === 'function'
+                  ? await credentials.readRecord('DEEPSEEK_PLATFORM_TOKEN')
+                  : undefined
+                configured = rec !== undefined && rec !== null
+              } catch { configured = false }
+              return send(200, { ok: true, configured })
+            }
+            if (req.method === 'POST' && path === '/cred') {
+              const credentials = ctx.get('credentials')
+              if (!credentials || typeof credentials.set !== 'function') return send(500, { ok: false, error: 'no credentials service' })
+              let value = ''
+              try {
+                const body = JSON.parse(await new Promise<string>((resolve, reject) => {
+                  let buf = ''
+                  req.on('data', (c: Buffer) => { buf += c.toString('utf8') })
+                  req.on('end', () => resolve(buf))
+                  req.on('error', reject)
+                }))
+                value = String((body && body.value) || '').trim()
+              } catch { return send(400, { ok: false, error: 'invalid json body' }) }
+              if (!value || value.length < 8) return send(400, { ok: false, error: 'token 太短' })
+              try {
+                await credentials.set('DEEPSEEK_PLATFORM_TOKEN', value)
+                await runCheck()
+                return send(200, { ok: true, configured: true })
+              } catch (e) {
+                return send(500, { ok: false, error: String(e instanceof Error ? e.message : e) })
+              }
+            }
             return send(404, { ok: false, error: 'not found' })
           } catch (e) {
             return send(500, { ok: false, error: String(e instanceof Error ? e.message : e) })

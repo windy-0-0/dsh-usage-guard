@@ -97,8 +97,83 @@ function GuardBadge(): React.ReactElement | null {
   )
 }
 
+/** 设置页：配置 DeepSeek 平台 token（精确对账凭据） */
+function SettingsPage(): React.ReactElement {
+  const [configured, setConfigured] = React.useState<boolean | null>(null)
+  const [value, setValue] = React.useState('')
+  const [busy, setBusy] = React.useState(false)
+  const [msg, setMsg] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    fetch('/dsh-usage-guard/api/cred-status')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d) setConfigured(Boolean(d.configured)) })
+      .catch(() => {})
+  }, [])
+
+  const save = () => {
+    if (!value.trim() || busy) return
+    setBusy(true)
+    setMsg(null)
+    fetch('/dsh-usage-guard/api/cred', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ value: value.trim() }),
+    })
+      .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+      .then(({ ok, d }) => {
+        setBusy(false)
+        if (ok && d.ok) { setConfigured(true); setValue(''); setMsg('✅ 已保存，精确对账已启用') }
+        else setMsg('❌ 保存失败：' + String((d && d.error) || '未知错误'))
+      })
+      .catch(() => { setBusy(false); setMsg('❌ 网络错误') })
+  }
+
+  return React.createElement(
+    'div',
+    { style: { padding: '12px 4px', maxWidth: 640 } },
+    React.createElement('h3', null, 'DeepSeek 平台 token'),
+    React.createElement('p', { style: { fontSize: 13, color: 'var(--dsw-alias-label-secondary, #888)', lineHeight: 1.7 } },
+      '用于官方用量精确对账（官方记录的 token 明显多于本机账本时红色告警）。' +
+      '到 DeepSeek 开放平台创建平台 token 后粘贴到下面。'),
+    configured === true
+      ? React.createElement('p', { style: { fontSize: 13, color: 'var(--dsw-alias-state-success-primary, #2e9e5b)' } },
+          '当前状态：已配置 ✅（值不回显；如已轮换请重新粘贴覆盖）')
+      : configured === false
+        ? React.createElement('p', { style: { fontSize: 13, color: 'var(--dsw-alias-state-warn-primary, #b8860b)' } },
+            '当前状态：未配置——精确对账未启用，仅余额哨兵模式。')
+        : null,
+    React.createElement('input', {
+      type: 'password',
+      value,
+      placeholder: '粘贴平台 token',
+      onChange: (e: React.ChangeEvent<HTMLInputElement>) => setValue(e.target.value),
+      style: {
+        width: '100%', padding: '8px 10px', borderRadius: '6px',
+        border: '1px solid var(--dsw-alias-border-l2, #999)',
+        background: 'transparent', color: 'var(--dsw-alias-label-primary, #333)',
+        fontSize: 13, marginBottom: 10,
+      },
+    }),
+    React.createElement('button', {
+      type: 'button',
+      onClick: save,
+      disabled: busy || !value.trim(),
+      style: {
+        padding: '7px 16px', borderRadius: '6px', cursor: 'pointer', fontSize: 13,
+        border: '1px solid var(--dsw-alias-border-l2, #999)',
+        background: 'transparent', color: 'var(--dsw-alias-label-primary, #333)',
+      },
+    }, busy ? '保存中…' : '保存'),
+    msg ? React.createElement('p', { style: { fontSize: 13, marginTop: 10 } }, msg) : null,
+  )
+}
+
 export function apply(ctx: any): void {
   ctx.effect(() => ctx.slots.inject('conversation.input.dock', () =>
     ctx.slots.register({ name: "conversation.input.dock", id: "dsh-usage-guard", order: 38, label: () => "用量守卫" }, GuardBadge),
   ), 'dsh-usage-guard: status line')
+  ctx.effect(() => ctx.slots.inject('settings.section', () =>
+    ctx.slots.register({ name: "settings.section", id: "usage-guard", order: 90, label: () => "用量守卫" }, SettingsPage),
+  ), 'dsh-usage-guard: settings page')
 }

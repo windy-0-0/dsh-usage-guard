@@ -1,6 +1,6 @@
 {
   "name": "dsh-usage-guard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH API 用量守卫：本地账本与 DeepSeek 官方用量精确对账 + 余额哨兵，疑似盗刷即时告警",
   "private": true,
   "type": "module",
