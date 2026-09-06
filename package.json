@@ -1,0 +1,80 @@
+{
+  "name": "dsh-usage-guard",
+  "version": "0.1.0",
+  "description": "DSH API 用量守卫：本地账本与 DeepSeek 官方用量精确对账 + 余额哨兵，疑似盗刷即时告警",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "files": [
+    "lib/client.js",
+    "lib/client.js.map",
+    "lib/index.js",
+    "lib/index.js.map",
+    "lib/types",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "BSD-3-Clause",
+  "peerDependencies": {
+    "cordis": ">=4.0.0-rc <5",
+    "schemastery": "^3.18.0",
+    "@deepseek-ai/dsh-client-ui-slots": ">=0.0.1-rc <2",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.1",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.2-rc.1",
+    "cordis": "4.0.0-rc.8",
+    "schemastery": "^3.18.0",
+    "typescript": "^5.9.0",
+    "tsdown": "^0.22.14"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:client": "tsdown",
+    "build:all": "npm run build && npm run build:client"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/windy-0-0/dsh-usage-guard.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "token",
+    "theft",
+    "usage",
+    "guard",
+    "billing"
+  ]
+}

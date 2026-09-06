@@ -1,0 +1,4 @@
+# Mounts dsh-usage-guard into the profile that installed it.
+- insert:
+    - id: usage-guard
+      name: "dsh-usage-guard"
