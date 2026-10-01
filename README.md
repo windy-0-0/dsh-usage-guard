@@ -57,7 +57,23 @@ npm install dsh-usage-guard
 ### 配置凭据（对账数据源）
 
 - `DEEPSEEK_API_KEY`：余额哨兵用（DSH 模型设置里已配置的 API key）；
-- `DEEPSEEK_PLATFORM_TOKEN`（推荐）：**平台 token**——精确对账必需。在 DeepSeek 开放平台创建平台 token 后，加入 DSH 凭据（名称必须为 `DEEPSEEK_PLATFORM_TOKEN`）。未配置时自动降级为余额哨兵模式。
+- `DEEPSEEK_PLATFORM_TOKEN`（推荐）：**精确对账必需**，未配置时自动降级为余额哨兵模式。
+
+> ⚠️ **`DEEPSEEK_PLATFORM_TOKEN` 要的不是 API key，而是「平台网页登录态 token」。**
+> 这是本插件早期 README 的一处误导（写"到开放平台创建平台 token"，按此指引会拿到一个
+> `sk-` 开头的 **API key**，而**用量明细接口不认它**，只会回 `{"code":40003,"Authorization Failed (invalid token)"}`）。
+>
+> **正确取法**：登录 <https://platform.deepseek.com> → 浏览器开发者工具 →
+> Application → Local Storage → `platform.deepseek.com` → 取 **`userToken`** 的值
+> （形如 `{"value":"<64位字符串>","__version":"0"}`，用里面的 `value`）。
+>
+> 注意区分：`chat.deepseek.com`（网页聊天版）也有一个 `userToken`，**两者不通用**——
+> 本插件必须用 `platform` 那个。
+>
+> 校验：填入后调用
+> `GET https://platform.deepseek.com/api/v0/users/get_user_summary`
+> （带 `Authorization: Bearer <token>` 与 `x-client-platform: web`）应返回 `{"code":0,...}`。
+> 若返回 `40003`，说明拿到的是 API key 或会话已过期。
 
 ## Roadmap
 

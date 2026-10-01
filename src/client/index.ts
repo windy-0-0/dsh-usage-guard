@@ -11,15 +11,26 @@ export const inject = ['slots']
 
 const SEC = 'var(--dsw-alias-label-secondary, #888)'
 const DANGER = 'var(--dsw-alias-state-error-primary, #d54941)'
+const WARN = 'var(--dsw-alias-state-warning-primary, #d28b1f)'
 
 interface GuardStatus {
   ok?: boolean
   checkedAt?: string
   local?: { tokens: number; costCny: number }
-  official?: { tokens?: number; costCny?: number; err?: string }
+  official?: { tokens?: number; costCny?: number; err?: string; detail?: string | null }
   balance?: { value: number; currency: string } | null
   alert?: string | null
   detail?: string | null
+  /** 两条检测路径各自是否真的在工作（2026-10-01 新增）。 */
+  health?: {
+    primary: string
+    primaryDetail?: string | null
+    primaryFailStreak?: number
+    sentinel: string
+    detectionActive?: boolean
+  }
+  /** 精确路径长期失效时置位——把"静默退化"变成看得见的告警。 */
+  healthAlert?: string | null
 }
 
 function fmtTokens(n: number): string {
@@ -70,12 +81,18 @@ function GuardBadge(): React.ReactElement | null {
     )
   }
 
+  // ── 能力失效告警（已按用户要求于 2026-10-01 关闭显示）────────────────────
+  // 背景：官方接口在 **HTTP 200** 里回业务错误码（实测 {"code":40003,"msg":"Authorization Failed"}）。
+  // 该状态下输入的提示横幅（⚠️ 精确对账不可用…）已被移除，不再出现在对话区。
+  // 注意：**判定逻辑与 host 端 healthAlert 上报完全保留未动**，仅隐藏这条 UI 文案。
+
   const balanceText = status.balance
     ? `余额 ¥${status.balance.value.toFixed(2)}`
     : (status.official?.err === 'no-platform-token' ? '未配平台 token（仅余额哨兵）' : '余额不可用')
+  // 官方用量不可用时不显示任何文案（原为 `官方用量不可用(${err})`，已按要求隐藏）
   const officialText = status.official && status.official.err === undefined
     ? `官方今日 ${fmtTokens(typeof status.official.tokens === 'number' ? status.official.tokens : 0)} tok`
-    : (status.official && status.official.err === 'no-platform-token' ? '' : '官方用量不可用')
+    : ''
   const localText = `本机 ${fmtTokens(status.local?.tokens ?? 0)} tok · ¥${(status.local?.costCny ?? 0).toFixed(4)}`
   const checked = status.checkedAt ? new Date(status.checkedAt) : null
   const checkedText = checked === null ? '' : `对账 ${String(checked.getHours()).padStart(2, '0')}:${String(checked.getMinutes()).padStart(2, '0')}`
