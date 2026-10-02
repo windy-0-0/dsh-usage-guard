@@ -6,6 +6,7 @@
  * 数据来自 host API /dsh-usage-guard/api/status（30 秒轮询）。
  */
 import * as React from 'react'
+import { guardView, fmtTokens } from '../guard-view.js'
 
 export const inject = ['slots']
 
@@ -31,13 +32,6 @@ interface GuardStatus {
   }
   /** 精确路径长期失效时置位——把"静默退化"变成看得见的告警。 */
   healthAlert?: string | null
-}
-
-function fmtTokens(n: number): string {
-  if (!Number.isFinite(n)) return '0'
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k'
-  return String(Math.round(n))
 }
 
 function GuardBadge(): React.ReactElement | null {
@@ -81,18 +75,40 @@ function GuardBadge(): React.ReactElement | null {
     )
   }
 
-  // ── 能力失效告警（已按用户要求于 2026-10-01 关闭显示）────────────────────
-  // 背景：官方接口在 **HTTP 200** 里回业务错误码（实测 {"code":40003,"msg":"Authorization Failed"}）。
-  // 该状态下输入的提示横幅（⚠️ 精确对账不可用…）已被移除，不再出现在对话区。
-  // 注意：**判定逻辑与 host 端 healthAlert 上报完全保留未动**，仅隐藏这条 UI 文案。
+  // ── 能力状态：降级必须**自己说出来**，而不是让文字悄悄消失 ────────────────
+  //
+  // ★ 2026-10-02 重做（用户指出：原"⚠️ 精确对账不可用"横幅**意义不明且常驻**，
+  //   因此毫无提示效果——问题不在"该不该显示"，而在**这个设计本身是坏的**）。
+  //
+  // 原设计的两个硬伤：
+  //   1. 它是**常驻横幅**：只要官方 token 没配好就永远挂在那里 ⇒ 用户很快对它视而不见，
+  //      真正的失效反而被淹没（"狼来了"）。
+  //   2. 它是**静态文案**：`healthAlert` 在接口里声明、host 端也算出来了，但渲染代码
+  //      从未使用 ⇒ **死代码**。官方接口挂掉时，UI 只是让「官方今日 …」那一小段**静默消失**，
+  //      整行照常显示 ⇒ 用户完全看不出对账能力已经失效。
+  //
+  // 新设计：状态判定抽成纯函数 `guardView`（可脱机自测），"守卫"本身即状态指示器，
+  // 失效时自己变色+说原因，且**只在真的失效时**才出现文字——不再常驻。
+  const view = guardView({
+    officialErr: status.official?.err,
+    failStreak: status.health?.primaryFailStreak,
+    sentinelOk: status.health?.sentinel === 'ok',
+    detectionActive: status.health?.detectionActive,
+    primaryDetail: status.health?.primaryDetail,
+    officialTokens: typeof status.official?.tokens === 'number' ? status.official.tokens : 0,
+  })
+  const failed = view.state === 'failed'
+  const guardLabel = view.label
+  const guardTitle = view.title
+  const guardColor = view.state === 'failed' ? DANGER
+    : view.state === 'ok' ? SEC : WARN
 
+  const err = status.official?.err
+  const isNoToken = err === 'no-platform-token'
   const balanceText = status.balance
     ? `余额 ¥${status.balance.value.toFixed(2)}`
-    : (status.official?.err === 'no-platform-token' ? '未配平台 token（仅余额哨兵）' : '余额不可用')
-  // 官方用量不可用时不显示任何文案（原为 `官方用量不可用(${err})`，已按要求隐藏）
-  const officialText = status.official && status.official.err === undefined
-    ? `官方今日 ${fmtTokens(typeof status.official.tokens === 'number' ? status.official.tokens : 0)} tok`
-    : ''
+    : (isNoToken ? '未配平台 token（仅余额哨兵）' : '余额不可用')
+  const officialText = view.officialText
   const localText = `本机 ${fmtTokens(status.local?.tokens ?? 0)} tok · ¥${(status.local?.costCny ?? 0).toFixed(4)}`
   const checked = status.checkedAt ? new Date(status.checkedAt) : null
   const checkedText = checked === null ? '' : `对账 ${String(checked.getHours()).padStart(2, '0')}:${String(checked.getMinutes()).padStart(2, '0')}`
@@ -104,11 +120,17 @@ function GuardBadge(): React.ReactElement | null {
         display: 'flex', alignItems: 'center', gap: '10px',
         fontSize: '11px', color: SEC, padding: '1px 6px 0', userSelect: 'none',
       },
-      title: 'dsh-usage-guard：本地账本与 DeepSeek 官方用量对账（每 15 分钟自动核对）',
+      title: guardTitle,
     },
-    React.createElement('span', null, '🛡 守卫'),
+    // 「守卫」本身即状态指示器：失效时变色并把原因写在脸上（不再常驻静态文案）。
+    React.createElement('span', {
+      style: { color: guardColor, fontWeight: failed ? 600 : 400 },
+    }, guardLabel),
     React.createElement('span', null, balanceText),
-    officialText ? React.createElement('span', null, officialText) : null,
+    // 失效时明确标红，避免"文字静默消失"造成的假安心。
+    officialText
+      ? React.createElement('span', failed ? { style: { color: DANGER } } : null, officialText)
+      : null,
     React.createElement('span', null, localText),
     checkedText ? React.createElement('span', null, checkedText) : null,
   )

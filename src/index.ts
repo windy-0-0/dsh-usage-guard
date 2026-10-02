@@ -31,9 +31,10 @@
  *    `ledger.jsonl` 24,001 行 / 3.8MB，**每 15 分钟全量读 + 全量 JSON.parse**。
  *    两个文件都只增不减。修法：读改为只读文件尾部；写改为按行数滚动裁剪。
  */
-import { appendFileSync, mkdirSync, existsSync, statSync, openSync, readSync, closeSync, writeFileSync, renameSync } from 'node:fs'
+import { appendFileSync, mkdirSync, existsSync, statSync, openSync, readSync, closeSync, writeFileSync, renameSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
+import { randomBytes } from 'node:crypto'
 
 export const name = 'dsh-usage-guard'
 /** 声明式硬依赖：webServer 就绪前不激活（bundle 装配早于服务时 ctx.get 拿空，路由静默丢失） */
@@ -166,6 +167,43 @@ export function officialWindowStart(now: Date = new Date()): number {
   return Math.floor(new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000)
 }
 
+/**
+ * 盗刷判据（纯函数，便于脱机自测）。
+ *
+ * ★ 2026-10-02 修复（R-L 事故，假盗刷告警）的核心：分母必须是**本机全部消耗**。
+ *
+ * 论证：官方消耗必然是「本机某次调用」的子集（key 只有本机在用），
+ * 因此 `totalTokens`（本机全部活动量）是「官方用量能否被本机解释」的**上界**。
+ * 分母取上界 ⇒ 比值偏小 ⇒ 偏向保守（少报而非误报）。
+ *
+ * 旧实现拿「归因到官方口径的 metered 量」当分母，隐含假设「我们知道自己哪些调用走了官方」——
+ * 而这恰恰是归因串味会破坏的东西：一个 deepseek-official 会话被误记成 trae 后，
+ * 它的消耗连同分母一起被剔除，比值虚高到 2.93 ⇒ 误报。
+ * 实测当天：官方 158M / metered 53.9M = 2.93（误报），而官方 158M / total 240.9M = 0.66（正常）。
+ *
+ * @param officialTokens 官方接口统计的 token
+ * @param totalTokens 本机账本**全部**消耗（含第三方中转/免费通道/本地推理）
+ * @param meteredTokens 本机归因到官方口径的消耗（仅用于诊断归因可信度）
+ * @param minDelta 触发所需的最小绝对差值（过滤噪声）
+ * @returns alert = 是否报盗刷；attributionSuspect = 是否有官方消耗被错记到第三方名下
+ */
+export function detectUsageAnomaly(
+  officialTokens: number,
+  totalTokens: number,
+  meteredTokens: number,
+  minDelta = 5000,
+): { alert: boolean; attributionSuspect: boolean } {
+  const o = num(officialTokens)
+  const total = num(totalTokens)
+  const metered = num(meteredTokens)
+  // 判据：官方用量显著超过**本机全部**活动量 ⇒ 无法被本机解释 ⇒ 疑似盗刷。
+  // 总量为 0 时不算（避免除零把 0 分母判成无穷比值）；这属于"账本没数据"，不是盗刷。
+  const alert = total > 0 && o / total > 1.2 && o - total > minDelta
+  // 诊断：官方超出"官方口径"统计但仍在"全部"统计之内 ⇒ 归因存疑（非盗刷）。
+  const attributionSuspect = !alert && o > metered + minDelta && o <= total + minDelta
+  return { alert, attributionSuspect }
+}
+
 const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0)
 
 const AUTH_SCHEME = 'Bearer'
@@ -224,6 +262,9 @@ interface SnapshotEntry {
   officialCost: number
   localTokens: number
   localCost: number
+  /** ★ 2026-10-02 新增：本机**全部**消耗（含第三方中转/免费通道），盗刷判据的分母。 */
+  totalTokens?: number
+  totalCost?: number
   balance: number | null
   currency: string | null
   /** 精确路径的失败原因（null = 上一次是成功的）。 */
@@ -270,18 +311,40 @@ export function readTailLines(file: string, maxBytes = TAIL_BYTES): string[] {
  * 失败一律静默——裁剪是维护动作，绝不能让主流程受影响。
  */
 export function rotateIfLarge(file: string, over = ROTATE_OVER_LINES, keep = KEEP_LINES): boolean {
+  if (!existsSync(file)) return false
+  const lock = `${file}.lock`
+  let lockFd: number | undefined
+  const tryLock = (): boolean => {
+    try { lockFd = openSync(lock, 'wx'); return true } catch { return false }
+  }
   try {
-    if (!existsSync(file)) return false
-    const lines = readTailLines(file, 0)
-    if (lines.length <= over) return false
-    const kept = lines.filter((l) => l.trim() !== '').slice(-keep)
-    const tmp = `${file}.rotating`
+    if (readTailLines(file, 0).length <= over) return false
+    if (!tryLock()) {
+      // 陈旧锁（>60s，例如持有者被 kill -9）才抢占；否则本轮让给持有者，下个周期再试。
+      let stale = false
+      try { stale = Date.now() - statSync(lock).mtimeMs > 60_000 } catch { stale = false }
+      if (!stale) return false
+      try { unlinkSync(lock) } catch { /* 竞态：别的实例已清掉 */ }
+      if (!tryLock()) return false
+    }
+    // 持锁后必须重读：等锁期间别的实例可能已完成裁剪。
+    const fresh = readTailLines(file, 0)
+    if (fresh.length <= over) return false
+    const kept = fresh.filter((l) => l.trim() !== '').slice(-keep)
+    // tmp 名必须唯一：固定名会让并发实例互相覆盖对方的临时文件。
+    const tmp = `${file}.rotating.${randomBytes(6).toString('hex')}`
     writeFileSync(tmp, kept.join('\n') + '\n', 'utf8')
     // 原子替换（同目录内 rename 才具备原子性）
     renameSync(tmp, file)
     return true
   } catch {
     return false
+  } finally {
+    // 只清理自己持有的锁——否则会把持有者的锁删掉，等于没锁。
+    if (lockFd !== undefined) {
+      try { closeSync(lockFd) } catch { /* 忽略 */ }
+      try { unlinkSync(lock) } catch { /* 忽略 */ }
+    }
   }
 }
 
@@ -363,15 +426,47 @@ export function primaryFailureStreak(snapshots: SnapshotEntry[]): number {
 export function apply(ctx: any): void {
   let snapshots: SnapshotEntry[] = readSnapshots()
   /**
-   * 最近一次 `request/header` 事件里的模型与平台 —— 供后续 `assistant/message` 归因。
+   * 每个会话最近一次 `request/header` / `request/context` 事件里的模型与平台 ——
+   * 供后续 `assistant/message` 归因。
    *
    * 为什么必须有：`assistant/message` 事件**通常不带** `data.source.provider`/`data.model`
    * （实测 2026-10-01：本机账本 1621 行 model/provider 全空）。不记住它们，就无法区分
    * 「DeepSeek 官方 API 消耗」与「第三方中转平台（codearts/buddy/…）消耗」——
    * 而后者根本不扣 DeepSeek 余额，混进来会把对账彻底带偏（实测本机 3.9 亿 tok vs 官方 9729 万）。
-   * 与 dsh-cost-meter 的 `state.currentModel/currentProvider` 同一做法。
+   *
+   * ★ 2026-10-02 修复（R-L 事故）：原实现是**单个全局对象** `{ model, provider }`，
+   *   被所有会话共用。本机同时跑多个 DSH 实例（web / desktop / free2 …）且多会话并发时，
+   *   A 会话的 `request/header` 会覆写 B 会话的归因值，导致 B 的 `assistant/message`
+   *   被记到 A 的 provider 名下 —— 即「归因串味」。
+   *   实测后果：一个 `deepseek-official` 会话（session-8b073e9d，1 亿 tok）被记成 `trae`，
+   *   而 `trae` 在 countsTowardDeepSeekBalance 里是**被剔除**的第三方 ⇒ 分母凭空少 1 亿，
+   *   比值 158/53.9=2.93 > 1.2 ⇒ **假盗刷告警**（当天真实用量 240.9M 其实 > 官方 158M，根本无盗刷）。
+   *   修法：按 `session.id` 分桶存储，归因只读**本会话**的桶。
    */
-  const current: { model: string; provider: string } = { model: '', provider: '' }
+  const currentBySession = new Map<string, { model: string; provider: string }>()
+  /** 没有 session.id 时的兜底桶（理论上不该走到，保留以免归因彻底丢失）。 */
+  const FALLBACK_KEY = '\u0000no-session'
+  const sessionKey = (session?: any): string => {
+    const id = session?.id
+    return typeof id === 'string' && id ? id : FALLBACK_KEY
+  }
+  const bucketOf = (session?: any): { model: string; provider: string } => {
+    const key = sessionKey(session)
+    let b = currentBySession.get(key)
+    if (b === undefined) {
+      b = { model: '', provider: '' }
+      // 防无界增长：会话数量远小于此，超限时清掉最早插入的若干条。
+      if (currentBySession.size >= 512) {
+        let n = 0
+        for (const k of currentBySession.keys()) {
+          currentBySession.delete(k)
+          if (++n >= 256) break
+        }
+      }
+      currentBySession.set(key, b)
+    }
+    return b
+  }
 
   const onSessionEvent = (event: any, session?: any): void => {
     if (event === null || typeof event !== 'object') return
@@ -381,8 +476,9 @@ export function apply(ctx: any): void {
     if (event.type === 'request/context') {
       const p = event?.data?.provider
       const m = event?.data?.model
-      if (typeof p === 'string' && p) current.provider = p
-      if (typeof m === 'string' && m) current.model = m
+      const b = bucketOf(session)
+      if (typeof p === 'string' && p) b.provider = p
+      if (typeof m === 'string' && m) b.model = m
       return
     }
 
@@ -392,8 +488,9 @@ export function apply(ctx: any): void {
       const cfg = event?.data?.header?.config
       const m = cfg?.model
       const p = cfg?.provider
-      if (typeof m === 'string' && m) current.model = m
-      if (typeof p === 'string' && p) current.provider = p
+      const b = bucketOf(session)
+      if (typeof m === 'string' && m) b.model = m
+      if (typeof p === 'string' && p) b.provider = p
       return
     }
 
@@ -405,18 +502,25 @@ export function apply(ctx: any): void {
     const output = num(usage.outputTokens)
     if (input + cacheRead + output === 0) return
     const ts = (typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now()) / 1000
-    // 归因优先级：事件自带 → 最近记住的 → 会话的 requestContext() 折叠值。
-    // 最后这条兜底至关重要：`request/context` 只在路由**变化**时 append，
-    // 实测一个模型没换过的会话整场 0 次该事件 ⇒ 只靠事件流归因会得到空 provider。
-    // `session.requestContext()` 是 session 对该折叠的缓存读取，无事件也能拿到当前路由。
+    // 归因优先级：事件自带 → 会话的 requestContext() 折叠值 → **本会话**最近记住的值。
+    //
+    // ★ 2026-10-02 修复（R-L 事故）：原优先级把「全局 current」排在 requestContext 之前，
+    //   而 current 是被所有会话共写的全局变量 ⇒ 多会话/多实例并发时归因串味。
+    //   现在：① 桶按 session.id 隔离；② requestContext()（session 自己的折叠缓存，按会话隔离、
+    //   无事件也能读到当前路由）优先于桶值，因为它是该会话的权威事实。
+    //   `request/context` 只在路由**变化**时 append，实测一个模型没换过的会话整场 0 次该事件，
+    //   所以桶值仍作为 requestContext 不可用时的兜底，不能删。
     let rc: any
     try { rc = typeof session?.requestContext === 'function' ? session.requestContext() : undefined } catch { rc = undefined }
+    const remembered = bucketOf(session)
+    const rcModel = typeof rc?.model === 'string' ? rc.model : ''
+    const rcProvider = typeof rc?.provider === 'string' ? rc.provider : ''
     const model = (typeof event?.data?.model === 'string' && event.data.model)
       ? event.data.model
-      : (current.model || (typeof rc?.model === 'string' ? rc.model : ''))
+      : (rcModel || remembered.model)
     const provider = (typeof event?.data?.source?.provider === 'string' && event.data.source.provider)
       ? event.data.source.provider
-      : (current.provider || (typeof rc?.provider === 'string' ? rc.provider : ''))
+      : (rcProvider || remembered.provider)
     const price = priceFor(model, provider)
     const off = isPeakTime(ts) ? 1 : 0
     const cost = (input / 1e6) * price.miss[off] + (cacheRead / 1e6) * price.hit[off] + (output / 1e6) * price.out[off]
@@ -527,11 +631,23 @@ export function apply(ctx: any): void {
 
     const official = await fetchOfficialUsage()
     const localEntries = readLedgerTail(windowStart)
-    // ★ 只统计**会扣 DeepSeek 官方余额**的消耗：第三方中转/免费通道/本地推理要剔除，
-    //   否则分母被无关消耗撑大，比值被压低 ⇒ 漏报（见 countsTowardDeepSeekBalance 注释）。
+    // 口径 A（metered）：只统计**会扣 DeepSeek 官方余额**的消耗（第三方中转/免费通道/本地推理剔除）。
+    //   自 2026-10-02 起它**不再直接充当盗刷判据**，只用于诊断归因是否可信 —— 原因见口径 B。
     const metered = localEntries.filter((e) => countsTowardDeepSeekBalance(e.provider))
     const localTokens = metered.reduce((a, e) => a + e.inputTokens + e.cacheReadTokens + e.outputTokens, 0)
     const localCost = metered.reduce((a, e) => a + e.costCny, 0)
+    // 口径 B（total）：本机**全部**消耗（含第三方中转/免费通道/本地推理）。
+    //
+    // ★ 2026-10-02 修复（R-L 事故，假盗刷告警）：盗刷的判据必须是「官方用量 > 本机全部活动量」。
+    //   旧实现拿 metered 当分母，隐含假设「我们知道自己哪些调用走了官方」—— 而这恰恰是
+    //   归因串味会破坏的东西：一个 deepseek-official 会话被误记成 trae 后，它的 1 亿 tok
+    //   连同分母一起被剔除，比值虚高到 2.93 ⇒ 报出「疑似盗刷」。
+    //   而当天本机总量 240.9M 其实 **大于** 官方 158M —— 官方用量完全能被本机活动解释，根本没有盗刷。
+    //   正确性论证：官方消耗必然是「本机某次调用」的子集（key 只有本机在用），
+    //   所以本机全部活动量是「官方用量能否被解释」的**上界**；分母取上界 ⇒ 比值偏小 ⇒
+    //   偏向保守（少报而非误报），与本插件既定的 fail-conservative 取向一致。
+    const totalTokens = localEntries.reduce((a, e) => a + e.inputTokens + e.cacheReadTokens + e.outputTokens, 0)
+    const totalCost = localEntries.reduce((a, e) => a + e.costCny, 0)
 
     let balance: number | null = null
     let currency: string | null = null
@@ -546,8 +662,11 @@ export function apply(ctx: any): void {
         const drop = prevBalanceSnap.balance - b.balance
         // ★ 同窗口比较：只统计「上次快照 → 现在」之间本机花掉的钱。
         //   同样只算会扣官方余额的部分——第三方中转的消耗不该替真盗刷"顶账"。
+        // ★ 2026-10-02 同步修复：这里同样改用**全部**消耗（含第三方）。
+        //   余额降幅由官方调用造成，而官方调用是本机全部调用的子集 ⇒ totalCost 才是
+        //   「这笔降幅能否被本机解释」的正确上界。原实现按 metered 过滤，一旦归因串味
+        //   就会低估 windowCost，把本机自己的消费误判成"无法解释的余额流失"。
         const windowCost = readLedgerTail(prevBalanceSnap.ts)
-          .filter((e) => countsTowardDeepSeekBalance(e.provider))
           .reduce((a, e) => a + e.costCny, 0)
         const verdict = detectBalanceAnomaly(drop, windowCost)
         if (verdict !== null) {
@@ -559,11 +678,22 @@ export function apply(ctx: any): void {
 
     let alert: string | null = null
     let detail: string | null = null
+    // ★ 2026-10-02：判据抽成纯函数 detectUsageAnomaly（可脱机自测），分母为**本机全部消耗**。
+    //   保留 metered 仅用于诊断——当「官方 > metered 但 ≤ total」时说明本机确有官方消耗
+    //   被归因到了第三方名下（归因存疑），这是需要暴露的信号，而不是盗刷。
+    let attributionSuspect = false
     if (official.err === undefined) {
-      const tokenRatio = localTokens > 0 ? official.tokens / localTokens : 0
-      if (tokenRatio > 1.2 && official.tokens - localTokens > 5000) {
+      const verdict = detectUsageAnomaly(official.tokens, totalTokens, localTokens)
+      attributionSuspect = verdict.attributionSuspect
+      if (verdict.alert) {
         alert = 'suspicious-external-usage'
-        detail = 'officialTokens=' + Math.round(official.tokens) + ' localTokens=' + Math.round(localTokens) + ' costDiff=' + (official.cost - localCost).toFixed(4)
+        // ★ 2026-10-02：detail 里带上「缺口能否被本机账本解释」的线索，便于区分
+        //   「真盗刷」与「本机有实例没装本插件」（后者是本机已知的第二条误报路径）。
+        detail = 'officialTokens=' + Math.round(official.tokens)
+          + ' totalLocalTokens=' + Math.round(totalTokens)
+          + ' gap=' + Math.round(Math.max(0, official.tokens - totalTokens))
+          + ' costDiff=' + (official.cost - totalCost).toFixed(4)
+          + '｜提示：gap 若与某个未装配本插件的实例（desktop/headless/tui/独立 DSH_HOME）用量吻合，则为覆盖不全而非盗刷'
       }
     }
 
@@ -572,6 +702,7 @@ export function apply(ctx: any): void {
       windowStart, windowEnd,
       officialTokens: official.tokens, officialCost: official.cost,
       localTokens, localCost,
+      totalTokens, totalCost,
       balance, currency,
       officialErr: official.err ?? null,
     }
@@ -590,10 +721,27 @@ export function apply(ctx: any): void {
     const primaryHealthy = official.err === undefined
     const sentinelHealthy = b !== null
 
+    // ★ 2026-10-02 新增（R-L 事故的**潜伏复发点**）：账本覆盖度。
+    //
+    // 官方用量统计的是**整个 API key** 的消耗，而本账本只记录**装了本插件的那一个 DSH 实例**
+    // 观察到的事件。本机实测：只有 `web` profile 装配了本插件；`desktop`（DSH.app）、
+    // `headless`、`dsh-tui` 均未装配，`free2` 更是独立 DSH_HOME（`~/.dsh-lane2`，独立账本）。
+    // ⇒ 这些实例若走官方通道，其消耗**必然**计入官方、却**不会**进入本账本。
+    //
+    // 后果：`totalTokens` 只是「本账本全部消耗」，并非「本机全部消耗」的真值。
+    // 缺口一旦随其他实例的官方用量增长而放大，就会把 官方/本账本总量 推过 1.2 阈值
+    // ——**与本次事故完全相同的误报路径**，只是成因从"归因串味"换成"账本覆盖不全"。
+    //
+    // 这里不改变报警行为（仍按 detectUsageAnomaly 判定），只把缺口显式暴露出来，
+    // 让它在**误报之前**就可见。阈值 5000 与判据的 minDelta 一致，过滤噪声。
+    const coverageGap = official.err === undefined ? Math.max(0, official.tokens - totalTokens) : 0
+
     return {
       ok: primaryHealthy || sentinelHealthy,
       checkedAt: new Date().toISOString(),
+      // local = 归因到官方口径的消耗（诊断用）；total = 本机全部消耗（盗刷判据的分母）
       local: { tokens: localTokens, costCny: Number(localCost.toFixed(6)) },
+      total: { tokens: totalTokens, costCny: Number(totalCost.toFixed(6)) },
       official: official.err === undefined
         ? { tokens: official.tokens, costCny: Number(official.cost.toFixed(6)) }
         : { err: official.err, detail: official.detail ?? null },
@@ -607,6 +755,16 @@ export function apply(ctx: any): void {
         sentinel: sentinelHealthy ? 'ok' : 'unavailable',
         // 防盗刷能力是否**真的**在生效：两条路径至少一条活着
         detectionActive: primaryHealthy || sentinelHealthy,
+        // ★ 2026-10-02 新增：归因可信度。'suspect' 表示官方用量超出了「官方口径」的
+        //   本机统计但仍在「全部」统计之内 ⇒ 有官方消耗被记到了第三方 provider 名下，
+        //   需检查归因（多为多实例/多会话并发下的串味）。此时**不**报盗刷。
+        attribution: attributionSuspect ? 'suspect' : 'ok',
+        // ★ 2026-10-02 新增：账本覆盖度。'gap' 表示官方用量**超过本账本全部消耗**
+        //   ⇒ 本机有实例没装本插件（或写了别的账本），其消耗计入了官方却不进本账本。
+        //   这是与「归因串味」并列的**第二条误报路径**：缺口放大到 1.2 倍即触发盗刷告警。
+        //   暴露它，是为了让人在误报发生**之前**就能区分「覆盖不全」与「真盗刷」。
+        coverage: coverageGap > 5000 ? 'gap' : 'ok',
+        coverageGapTokens: coverageGap,
       },
       healthAlert,
     }
